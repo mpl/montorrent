@@ -7,7 +7,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"errors"
+//	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -55,20 +55,15 @@ func rpc(args ...string) ([]byte, error) {
 	return answer, nil
 }
 
-func downloadList() ([]string, error) {
-	answer, err := rpc(*scgi, "download_list", "")
-	if err != nil {
-		return nil, err
-	}
-	// TODO(mpl): refactor this scanning
+func scanAnswer(answer []byte, prefix, suffix string) ([]string, error) {
 	var list []string
 	scanner := bufio.NewScanner(bytes.NewReader(answer))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "<value><string>") || !strings.HasSuffix(line, "</string></value>") {
+		if !strings.HasPrefix(line, prefix) || !strings.HasSuffix(line, suffix) {
 			continue
 		}
-		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<value><string>"), "</string></value>"))
+		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, prefix), suffix))
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("could not scan answer: %v", err)
@@ -76,27 +71,25 @@ func downloadList() ([]string, error) {
 	return list, nil
 }
 
+func downloadList() ([]string, error) {
+	answer, err := rpc(*scgi, "download_list", "")
+	if err != nil {
+		return nil, err
+	}
+	return scanAnswer(answer, "<value><string>", "</string></value>")
+}
+
 func torrentName(torrentHash string) (string, error) {
 	answer, err := rpc(*scgi, "d.name", torrentHash)
 	if err != nil {
 		return "", err
 	}
-	var list []string
-	scanner := bufio.NewScanner(bytes.NewReader(answer))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "<param><value><string>") || !strings.HasSuffix(line, "</string></value></param>") {
-			continue
-		}
-		println(line)
-		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<param><value><string>"), "</string></value></param>"))
-		break
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("could not scan answer: %v", err)
+	list, err := scanAnswer(answer, "<param><value><string>", "</string></value></param>")
+	if err != nil {
+		return "", err
 	}
 	if len(list) == 0 {
-		return "", errors.New("name not found")
+		return "", fmt.Errorf("%v: name not found", torrentHash)
 	}
 	return list[0], nil
 }
@@ -107,22 +100,12 @@ func bytesDone(torrentHash string) (int, error) {
 	if err != nil {
 		return n, err
 	}
-	var list []string
-	scanner := bufio.NewScanner(bytes.NewReader(answer))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "<param><value><i8>") || !strings.HasSuffix(line, "</i8></value></param>") {
-			continue
-		}
-		println(line)
-		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<param><value><i8>"), "</i8></value></param>"))
-		break
-	}
-	if err := scanner.Err(); err != nil {
-		return n, fmt.Errorf("could not scan answer: %v", err)
+	list, err := scanAnswer(answer, "<param><value><i8>", "</i8></value></param>")
+	if err != nil {
+		return n, err
 	}
 	if len(list) == 0 {
-		return n, errors.New("bytes_done not found")
+		return n, fmt.Errorf("%v: bytes_done not found", torrentHash)
 	}
 	n, err = strconv.Atoi(list[0])
 	if err != nil {
