@@ -25,7 +25,6 @@ var (
 const (
 	numRetry = 20
 	retryDelay = 2 * time.Second
-	rpc = "rtorrentrpc"
 )
 
 func usage() {
@@ -34,15 +33,16 @@ func usage() {
 }
 
 type status struct {
+	name string
 	bytesDone int
 	bytesTotal int
 	percentDone int
 }
 
-func downloadList() ([]string, error) {
+func rpc(args ...string) ([]byte, error) {
 	var answer []byte
 	for i:=0; i<numRetry; i++ {
-		cmd := exec.Command(rpc, *scgi, "download_list", "")
+		cmd := exec.Command("rtorrentrpc", args...)
 		output, err := cmd.Output()
 		if err != nil {
 			return nil, err
@@ -54,7 +54,15 @@ func downloadList() ([]string, error) {
 		time.Sleep(retryDelay)
 	}
 	if len(answer) == 0 {
-		return nil, errors.New("empty answer")
+		return nil, fmt.Errorf("empty answer for %v", args)
+	}
+	return answer, nil
+}
+
+func downloadList() ([]string, error) {
+	answer, err := rpc(*scgi, "download_list", "")
+	if err != nil {
+		return nil, err
 	}
 	var list []string
 	scanner := bufio.NewScanner(bytes.NewReader(answer))
@@ -71,6 +79,40 @@ func downloadList() ([]string, error) {
 	return list, nil
 }
 
+func torrentName(torrentHash string) (string, error) {
+	answer, err := rpc(*scgi, "name", "torrentHash")
+	if err != nil {
+		return "", err
+	}
+	var list []string
+	scanner := bufio.NewScanner(bytes.NewReader(answer))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "<value><string>") || !strings.HasSuffix(line, "</string></value>") {
+			continue
+		}
+		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<value><string>"), "</string></value>"))
+		break
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("could not scan answer: %v", err)
+	}
+	if len(list) == 0 {
+		return "", errors.New("name not found")
+	}
+	return list[0], nil
+}
+
+func torrentStatus(torrentHash string) (*status, error) {
+	name, err := torrentName(torrentHash)
+	if err != nil {
+		return nil, err
+	}
+	return &status {
+		name: name,
+	}, nil
+}
+
 func main() {
 	flag.Usage = usage
 	flag.Parse()
@@ -80,7 +122,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	allStatus := make(map[string]*status)
 	for _,v := range list {
-		println(v)
+		tStatus, err := torrentStatus(v)
+		if err != nil {
+			log.Fatal(err)
+		}
+		allStatus[v] = tStatus
+	}
+	for _,v := range allStatus {
+		println(v.name)
 	}
 }
