@@ -7,25 +7,35 @@ package main
 import (
 	"bufio"
 	"bytes"
-	//	"errors"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/mpl/basicauth"
 )
 
 var (
-	scgi = flag.String("scgi", "localhost:5000", "host:port for rtorrent's scgi.")
-	host = flag.String("host", "localhost:8080", "where to serve the status")
+	cache    = flag.Int("cache", 0, "cache the status for that many seconds. 0 means no caching")
+	help     = flag.Bool("h", false, "show this help")
+	host     = flag.String("host", "localhost:8080", "listening host:port")
+	scgi     = flag.String("scgi", "localhost:5000", "host:port for rtorrent's scgi.")
+	secure   = flag.Bool("tls", false, "for https. cert.pem and key.pem in current dir will be used.")
+	userpass = flag.String("userpass", "", "optional username:password protection")
+	verbose  = flag.Bool("v", false, "verbose")
 )
 
 const (
 	numRetry   = 20
 	retryDelay = 2 * time.Second
+	idstring   = "http://golang.org/pkg/http/#ListenAndServe"
 )
 
 func usage() {
@@ -40,7 +50,9 @@ func rpc(args ...string) ([]byte, error) {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			// TODO(mpl): diagnose better the error and return early if it's not the expected EOF one.
-			log.Printf("ignoring error: %v", err)
+			if *verbose {
+				log.Printf("ignoring error: %v", err)
+			}
 			continue
 		}
 		if len(output) > 0 {
@@ -134,16 +146,15 @@ func bytesLeft(torrentHash string) (int, error) {
 	return n, nil
 }
 
-type status struct {
-	name        string
-	bytesDone   int
-	bytesLeft   int
-	bytesTotal  int
-	percentDone int
+type torrentStatus struct {
+	Name        string
+	BytesDone   int
+	BytesLeft   int
+	BytesTotal  int
+	PercentDone int
 }
 
-func torrentStatus(torrentHash string) (*status, error) {
-	println("TORRENTSTATUS")
+func getStatus(torrentHash string) (*torrentStatus, error) {
 	name, err := torrentName(torrentHash)
 	if err != nil {
 		return nil, err
@@ -158,32 +169,121 @@ func torrentStatus(torrentHash string) (*status, error) {
 	}
 	total := nDone + nLeft // yay, super precision!!
 	percent := nDone * 100 / total
-	return &status{
-		name:        name,
-		bytesDone:   nDone,
-		bytesLeft:   nLeft,
-		bytesTotal:  total,
-		percentDone: percent,
+	return &torrentStatus{
+		Name:        name,
+		BytesDone:   nDone,
+		BytesLeft:   nLeft,
+		BytesTotal:  total,
+		PercentDone: percent,
 	}, nil
 }
+
+func makeHandler(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if e, ok := recover().(error); ok {
+				http.Error(w, e.Error(), http.StatusInternalServerError)
+				return
+			}
+		}()
+		w.Header().Set("Server", idstring)
+		if up.IsAllowed(r) {
+			fn(w, r)
+		} else {
+			basicauth.SendUnauthorized(w, r, "montorrent")
+		}
+	}
+}
+
+func serveJSON(w http.ResponseWriter, r *http.Request, data []byte) {
+	w.Header().Set("Content-Type", "text/javascript")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)+1))
+	w.WriteHeader(200)
+	w.Write(data)
+	w.Write([]byte("\n"))
+}
+
+func serveStatus(w http.ResponseWriter, r *http.Request) {
+	if *cache > 0 {
+		lastUpdateMu.RLock()
+		// TODO(mpl): maybe use a checkLastModified. pull it out of simpleHttpd as a lib?
+		if time.Now().Before(lastUpdate.Add(time.Duration(*cache) * time.Second)) {
+			defer lastUpdateMu.RUnlock()
+			statusMu.RLock()
+			defer statusMu.RUnlock()
+			data, err := json.MarshalIndent(status, "", "	")
+			if err != nil {
+				if *verbose {
+					log.Printf("could not get json encode: %v", err)
+				}
+				http.Error(w, "could not json encode", http.StatusInternalServerError)
+				return
+			}
+			serveJSON(w, r, data)
+			return
+		}
+		lastUpdateMu.RUnlock()
+	}
+	list, err := downloadList()
+	if err != nil {
+		if *verbose {
+			log.Printf("could not get torrents list: %v", err)
+		}
+		http.Error(w, "could not get torrents list", http.StatusInternalServerError)
+		return
+	}
+	allStatus := make(map[string]*torrentStatus)
+	for _, v := range list {
+		tStatus, err := getStatus(v)
+		if err != nil {
+			if *verbose {
+				log.Printf("could not get torrent status: %v", err)
+			}
+			http.Error(w, "could not get torrent status", http.StatusInternalServerError)
+			return
+		}
+		allStatus[v] = tStatus
+	}
+	lastUpdateMu.Lock()
+	defer lastUpdateMu.Unlock()
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	data, err := json.MarshalIndent(allStatus, "", "	")
+	if err != nil {
+		if *verbose {
+			log.Printf("could not get json encode: %v", err)
+		}
+		http.Error(w, "could not json encode", http.StatusInternalServerError)
+		return
+	}
+	status = allStatus
+	lastUpdate = time.Now()
+	serveJSON(w, r, data)
+}
+
+var (
+	up *basicauth.UserPass
+
+	statusMu sync.RWMutex
+	status   map[string]*torrentStatus
+
+	lastUpdateMu sync.RWMutex
+	lastUpdate   time.Time
+)
 
 func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	list, err := downloadList()
+	var err error
+	up, err = basicauth.New(*userpass)
 	if err != nil {
 		log.Fatal(err)
 	}
-	allStatus := make(map[string]*status)
-	for _, v := range list {
-		tStatus, err := torrentStatus(v)
-		if err != nil {
-			log.Fatal(err)
-		}
-		allStatus[v] = tStatus
+	if *verbose {
+		basicauth.Verbose = true
 	}
-	for _, v := range allStatus {
-		fmt.Printf("%s | %d / %d | %d\n", v.name, v.bytesDone, v.bytesTotal, v.percentDone)
-	}
+
+	http.Handle("/", makeHandler(serveStatus))
+	http.ListenAndServe(*host, nil)
 }
