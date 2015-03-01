@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,13 +31,6 @@ const (
 func usage() {
 	flag.PrintDefaults()
 	os.Exit(2)
-}
-
-type status struct {
-	name string
-	bytesDone int
-	bytesTotal int
-	percentDone int
 }
 
 func rpc(args ...string) ([]byte, error) {
@@ -66,6 +60,7 @@ func downloadList() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// TODO(mpl): refactor this scanning
 	var list []string
 	scanner := bufio.NewScanner(bytes.NewReader(answer))
 	for scanner.Scan() {
@@ -106,14 +101,56 @@ func torrentName(torrentHash string) (string, error) {
 	return list[0], nil
 }
 
+func bytesDone(torrentHash string) (int, error) {
+	var n int
+	answer, err := rpc(*scgi, "d.get_bytes_done", torrentHash)
+	if err != nil {
+		return n, err
+	}
+	var list []string
+	scanner := bufio.NewScanner(bytes.NewReader(answer))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "<param><value><i8>") || !strings.HasSuffix(line, "</i8></value></param>") {
+			continue
+		}
+		println(line)
+		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<param><value><i8>"), "</i8></value></param>"))
+		break
+	}
+	if err := scanner.Err(); err != nil {
+		return n, fmt.Errorf("could not scan answer: %v", err)
+	}
+	if len(list) == 0 {
+		return n, errors.New("bytes_done not found")
+	}
+	n, err = strconv.Atoi(list[0])
+	if err != nil {
+		return n, fmt.Errorf("could not convert bytes_done to int: %v", err)
+	}
+	return n, nil
+}
+
+type status struct {
+	name string
+	bytesDone int
+	bytesTotal int
+	percentDone int
+}
+
 func torrentStatus(torrentHash string) (*status, error) {
 	println("TORRENTSTATUS")
 	name, err := torrentName(torrentHash)
 	if err != nil {
 		return nil, err
 	}
+	nDone, err := bytesDone(torrentHash)
+	if err != nil {
+		return nil, err
+	}
 	return &status {
 		name: name,
+		bytesDone: nDone,
 	}, nil
 }
 
@@ -135,6 +172,11 @@ func main() {
 		allStatus[v] = tStatus
 	}
 	for _,v := range allStatus {
-		println(v.name)
+		println(v.name + " | " + fmt.Sprintf("%d", v.bytesDone))
 	}
 }
+
+/*
+d.get_bytes_done
+d.get_left_bytes
+*/
