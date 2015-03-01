@@ -7,7 +7,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-//	"errors"
+	//	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -24,7 +24,7 @@ var (
 )
 
 const (
-	numRetry = 20
+	numRetry   = 20
 	retryDelay = 2 * time.Second
 )
 
@@ -35,13 +35,13 @@ func usage() {
 
 func rpc(args ...string) ([]byte, error) {
 	var answer []byte
-	for i:=0; i<numRetry; i++ {
+	for i := 0; i < numRetry; i++ {
 		cmd := exec.Command("rtorrentrpc", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			// TODO(mpl): diagnose better the error and return early if it's not the expected EOF one.
 			log.Printf("ignoring error: %v", err)
-				continue
+			continue
 		}
 		if len(output) > 0 {
 			answer = output
@@ -114,10 +114,31 @@ func bytesDone(torrentHash string) (int, error) {
 	return n, nil
 }
 
+func bytesLeft(torrentHash string) (int, error) {
+	var n int
+	answer, err := rpc(*scgi, "d.get_left_bytes", torrentHash)
+	if err != nil {
+		return n, err
+	}
+	list, err := scanAnswer(answer, "<param><value><i8>", "</i8></value></param>")
+	if err != nil {
+		return n, err
+	}
+	if len(list) == 0 {
+		return n, fmt.Errorf("%v: bytes_left not found", torrentHash)
+	}
+	n, err = strconv.Atoi(list[0])
+	if err != nil {
+		return n, fmt.Errorf("could not convert bytes_left to int: %v", err)
+	}
+	return n, nil
+}
+
 type status struct {
-	name string
-	bytesDone int
-	bytesTotal int
+	name        string
+	bytesDone   int
+	bytesLeft   int
+	bytesTotal  int
 	percentDone int
 }
 
@@ -131,9 +152,18 @@ func torrentStatus(torrentHash string) (*status, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &status {
-		name: name,
-		bytesDone: nDone,
+	nLeft, err := bytesLeft(torrentHash)
+	if err != nil {
+		return nil, err
+	}
+	total := nDone + nLeft // yay, super precision!!
+	percent := nDone * 100 / total
+	return &status{
+		name:        name,
+		bytesDone:   nDone,
+		bytesLeft:   nLeft,
+		bytesTotal:  total,
+		percentDone: percent,
 	}, nil
 }
 
@@ -141,25 +171,19 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-
 	list, err := downloadList()
 	if err != nil {
 		log.Fatal(err)
 	}
 	allStatus := make(map[string]*status)
-	for _,v := range list {
+	for _, v := range list {
 		tStatus, err := torrentStatus(v)
 		if err != nil {
 			log.Fatal(err)
 		}
 		allStatus[v] = tStatus
 	}
-	for _,v := range allStatus {
-		println(v.name + " | " + fmt.Sprintf("%d", v.bytesDone))
+	for _, v := range allStatus {
+		fmt.Printf("%s | %d / %d | %d\n", v.name, v.bytesDone, v.bytesTotal, v.percentDone)
 	}
 }
-
-/*
-d.get_bytes_done
-d.get_left_bytes
-*/
