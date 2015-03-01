@@ -43,9 +43,11 @@ func rpc(args ...string) ([]byte, error) {
 	var answer []byte
 	for i:=0; i<numRetry; i++ {
 		cmd := exec.Command("rtorrentrpc", args...)
-		output, err := cmd.Output()
+		output, err := cmd.CombinedOutput()
 		if err != nil {
-			return nil, err
+			// TODO(mpl): diagnose better the error and return early if it's not the expected EOF one.
+			log.Printf("ignoring error: %v", err)
+				continue
 		}
 		if len(output) > 0 {
 			answer = output
@@ -80,7 +82,7 @@ func downloadList() ([]string, error) {
 }
 
 func torrentName(torrentHash string) (string, error) {
-	answer, err := rpc(*scgi, "name", "torrentHash")
+	answer, err := rpc(*scgi, "d.name", torrentHash)
 	if err != nil {
 		return "", err
 	}
@@ -88,10 +90,11 @@ func torrentName(torrentHash string) (string, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(answer))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "<value><string>") || !strings.HasSuffix(line, "</string></value>") {
+		if !strings.HasPrefix(line, "<param><value><string>") || !strings.HasSuffix(line, "</string></value></param>") {
 			continue
 		}
-		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<value><string>"), "</string></value>"))
+		println(line)
+		list = append(list, strings.TrimSuffix(strings.TrimPrefix(line, "<param><value><string>"), "</string></value></param>"))
 		break
 	}
 	if err := scanner.Err(); err != nil {
@@ -104,6 +107,7 @@ func torrentName(torrentHash string) (string, error) {
 }
 
 func torrentStatus(torrentHash string) (*status, error) {
+	println("TORRENTSTATUS")
 	name, err := torrentName(torrentHash)
 	if err != nil {
 		return nil, err
