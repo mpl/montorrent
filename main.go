@@ -285,5 +285,8 @@ func main() {
 	}
 
 	http.Handle("/", makeHandler(serveStatus))
+	if *secure {
+		log.Fatal(http.ListenAndServeTLS(*host, "cert.pem", "key.pem", nil))
+	}
 	http.ListenAndServe(*host, nil)
 }
