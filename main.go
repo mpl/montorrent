@@ -7,29 +7,36 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mpl/basicauth"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 var (
-	cache    = flag.Int("cache", 0, "cache the status for that many seconds. 0 means no caching")
-	help     = flag.Bool("h", false, "show this help")
-	host     = flag.String("host", "localhost:8080", "listening host:port")
-	scgi     = flag.String("scgi", "localhost:5000", "host:port for rtorrent's scgi.")
-	secure   = flag.Bool("tls", false, "for https. cert.pem and key.pem in current dir will be used.")
-	userpass = flag.String("userpass", "", "optional username:password protection")
-	verbose  = flag.Bool("v", false, "verbose")
+	cache   = flag.Int("cache", 0, "cache the status for that many seconds. 0 means no caching")
+	help    = flag.Bool("h", false, "show this help")
+	host    = flag.String("host", "localhost:8080", "listening host:port")
+	scgi    = flag.String("scgi", "localhost:5000", "host:port for rtorrent's scgi.")
+	flagTLS = flag.Bool("tls", false, `For https. If "key.pem" or "cert.pem" are not found in $HOME/keys/, in-memory self-signed are generated and used instead.`)
+
+	flagAutocert = flag.Bool("autocert", false, `Get https certificate from Let's Encrypt. Implies -tls=true. Obviously -host must contain a full qualified domain name. The cached certificate(s) will be in $HOME/keys/letsencrypt.cache.`)
+	userpass     = flag.String("userpass", "", "optional username:password protection")
+	verbose      = flag.Bool("v", false, "verbose")
 )
 
 const (
@@ -261,8 +268,42 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 	serveJSON(w, r, data)
 }
 
+func setupTLS() (*tls.Config, error) {
+	hostname := *host
+	if strings.Contains(hostname, ":") {
+		h, _, err := net.SplitHostPort(hostname)
+		if err != nil {
+			return nil, err
+		}
+		hostname = h
+	}
+	if *flagAutocert {
+		m := autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(hostname),
+			Cache:      autocert.DirCache(certCache),
+		}
+		return &tls.Config{
+			GetCertificate: m.GetCertificate,
+		}, nil
+	}
+	cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to load TLS cert: %v", err)
+	}
+	return &tls.Config{
+		Rand:         rand.Reader,
+		Time:         time.Now,
+		NextProtos:   []string{"http/1.1"},
+		Certificates: []tls.Certificate{cert},
+	}, nil
+}
+
 var (
-	up *basicauth.UserPass
+	up        *basicauth.UserPass
+	tlsKey    = filepath.Join(os.Getenv("HOME"), "keys", "key.pem")
+	tlsCert   = filepath.Join(os.Getenv("HOME"), "keys", "cert.pem")
+	certCache = filepath.Join(os.Getenv("HOME"), "keys", "letsencrypt.cache")
 
 	statusMu sync.RWMutex
 	status   map[string]*torrentStatus
@@ -284,9 +325,23 @@ func main() {
 		basicauth.Verbose = true
 	}
 
-	http.Handle("/", makeHandler(serveStatus))
-	if *secure {
-		log.Fatal(http.ListenAndServeTLS(*host, "cert.pem", "key.pem", nil))
+	listener, err := net.Listen("tcp", *host)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", *host, err)
 	}
-	http.ListenAndServe(*host, nil)
+
+	if !*flagTLS && *flagAutocert {
+		*flagTLS = true
+	}
+
+	if *flagTLS {
+		config, err := setupTLS()
+		if err != nil {
+			log.Fatalf("could not configure TLS connection: %v", err)
+		}
+		listener = tls.NewListener(listener, config)
+	}
+
+	http.Handle("/", makeHandler(serveStatus))
+	log.Fatal(http.Serve(listener, nil))
 }
